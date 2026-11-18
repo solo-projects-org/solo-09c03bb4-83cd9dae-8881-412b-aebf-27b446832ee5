@@ -26,6 +26,7 @@ docker compose up --build -d
 | GET | `/scenes` | 按 bbox（`west,south,east,north`）与 `start_time/end_time`（UTC ISO-8601）查询，只返回每个景的**现行修订** |
 | GET | `/scenes/{scene_id}/revisions/{revision}` | 取任意历史修订（含被取代的旧修订）及其下载地址 |
 | GET | `/scenes/{scene_id}/revisions/{revision}/bands/{band}/download` | 下载 B04/B08，响应头带 `X-SHA-256` |
+| GET | `/scenes/{scene_id}/ndvi?threshold=0.3` | 对**现行修订**的 B04/B08 单景计算 NDVI 统计（阈值 `-1～1`，必填） |
 | GET | `/health` | 存活/数据库检查 |
 
 ### 提交示例
@@ -46,6 +47,27 @@ curl -X POST http://localhost:8000/scenes/S2A_MSIL1C_001/revisions \
 ```bash
 curl "http://localhost:8000/scenes?west=116.2&south=39.2&east=116.8&north=39.8&start_time=2026-06-01T00:00:00Z&end_time=2026-06-30T23:59:59Z"
 ```
+
+### 单景 NDVI 示例
+
+```bash
+curl "http://localhost:8000/scenes/S2A_MSIL1C_001/ndvi?threshold=0.3"
+```
+
+```json
+{
+  "scene_id": "S2A_MSIL1C_001",
+  "revision": 3,
+  "acquisition_time": "2026-07-01T10:00:00.000000Z",
+  "threshold": 0.3,
+  "valid_pixel_count": 1048576,
+  "ndvi_mean": 0.4312,
+  "fraction_below_threshold": 0.1875
+}
+```
+
+无有效像元时 `valid_pixel_count=0`，`ndvi_mean` 与 `fraction_below_threshold` 均为 `null`。
+该景不存在任何修订返回 `404`；阈值超出 `[-1, 1]`、`NaN`/`Inf` 或缺少该参数返回 `422`。
 
 ## 3. 一致性规则（如何满足需求）
 
@@ -68,16 +90,29 @@ curl "http://localhost:8000/scenes?west=116.2&south=39.2&east=116.8&north=39.8&s
      相同内容并发提交只有一个 `201`，其余幂等 `200`，冲突内容一个成功一个 `409`；
    - 启动时执行目录完整性检查（每条 band 记录的文件必须存在），缺失则拒绝启动；
      同时清理崩溃遗留的 `tmp/upload-*.part`。
+7. **NDVI 只做分析，不改变入库规则**：目录允许登记任意普通文件（上传规则不变）。
+   `GET /scenes/{scene_id}/ndvi` 只针对现行修订，按文件自身块结构对齐的窗口
+   （约 512×512 像元、单窗 ≤ 2 MiB 浮点缓冲）分块读取两个单波段 GeoTIFF，
+   峰值内存与景大小无关（GDAL 块缓存默认压到 16 MB，可用 `GDAL_CACHEMAX` 覆盖）；
+   两个波段必须同格网（宽高、CRS、仿射变换一致），否则只让这一次分析返回 `422`，
+   查询与下载照常。各波段按自身 `scale`/`offset`（GDAL 元数据优先，其次同名
+   band 标签）换算反射率，未标注则用原值。排除 NoData、非有限值、负反射率与
+   零分母的像元后统计有效像元数、NDVI 均值与严格低于阈值的比例。
+8. **分析期间可继续提交修订，但不交付过期结果**：分析开始前记录现行修订号，
+   结果返回前再次核对；若期间出现了更新的修订，接口返回 `409` 并提示重试，
+   绝不把旧修订的统计当作现行结果返回。查询与提交互不阻塞。
 
 ## 4. 本地测试（无 Docker 时）
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt httpx pytest
-pytest            # 15 个端到端用例（含并发、重启、下载交错）
+pip install -r requirements.txt pytest httpx
+pytest            # 33 个端到端用例（含并发、重启、下载交错、NDVI 分块/缺测/修订交错）
 uvicorn app.main:app --port 8000
 ```
 
 测试覆盖：双波段验真、校验失败无残留、幂等回放、冲突拒绝、迟到修订拒绝、
 时空过滤与现行修订、新旧修订下载交错、4 路并发相同/冲突提交、重启持久化、
-缺失文件拒绝启动、临时文件启动清理。
+缺失文件拒绝启动、临时文件启动清理；NDVI 的 scale/offset 换算、未标注原值、
+NoData/非有限值/负反射率/零分母排除、无有效像元返回 null、阈值边界、非 GeoTIFF
+与格网不符仅拒绝本次分析、分块读取不整景载入、分析期间提交修订导致结果过期。

@@ -1,6 +1,7 @@
 """FastAPI application: scene revision catalog with verified band files."""
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
@@ -22,7 +24,8 @@ from fastapi.responses import FileResponse, RedirectResponse, Response
 from . import storage
 from .config import Settings, get_settings
 from .db import check_db_alive, get_conn, init_db
-from .schemas import BandOut, HealthOut, RevisionOut, SceneSummary
+from .ndvi import AnalysisError, compute_ndvi
+from .schemas import BandOut, HealthOut, NdviOut, RevisionOut, SceneSummary
 
 _SCENE_ID_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,128}$")
 _BANDS = ("B04", "B08")
@@ -107,6 +110,20 @@ def _bands_out(
             )
         )
     return result
+
+
+def _current_revision_version(
+    scene_id: str, conn: sqlite3.Connection
+) -> Optional[tuple[int, str]]:
+    """Return (revision, acquisition_time) of a scene's current revision."""
+    row = conn.execute(
+        "SELECT revision, acquisition_time FROM scenes "
+        "WHERE scene_id = ? ORDER BY revision DESC LIMIT 1",
+        (scene_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["revision"], row["acquisition_time"]
 
 
 def _revision_out(
@@ -415,6 +432,91 @@ def get_revision(
     if row is None:
         raise HTTPException(404, f"scene {scene_id} revision {revision} not found")
     return _revision_out(request, settings, conn, row, None)
+
+
+@app.get(
+    "/scenes/{scene_id}/ndvi",
+    response_model=NdviOut,
+    tags=["analysis"],
+    responses={
+        404: {"description": "Scene has no cataloged revision"},
+        409: {"description": "The current revision changed during the analysis; retry"},
+        422: {"description": "Invalid threshold, or the current revision's bands are not co-grid single-band GeoTIFFs"},
+    },
+)
+def scene_ndvi(
+    scene_id: str,
+    conn: Annotated[sqlite3.Connection, Depends(db_conn)],
+    threshold: Annotated[
+        float,
+        Query(
+            ge=-1,
+            le=1,
+            description="Count valid pixels whose NDVI is strictly below this value",
+        ),
+    ],
+):
+    """Compute NDVI statistics for the CURRENT revision of one scene.
+
+    The current B04 and B08 GeoTIFFs are read in windows (never as a whole
+    scene in memory), converted to reflectance with each band's own
+    scale/offset metadata, and reduced to summary statistics.  Only this
+    analysis is rejected when the band files are not GeoTIFFs or do not share
+    one pixel grid; catalog queries and downloads are unaffected.
+    """
+    settings = get_settings()
+    _validate_scene_id(scene_id)
+    if not math.isfinite(threshold):
+        raise HTTPException(422, "threshold must be a finite number")
+
+    version = _current_revision_version(scene_id, conn)
+    if version is None:
+        raise HTTPException(404, f"scene {scene_id} has no cataloged revision")
+    revision, acquisition_time = version
+
+    paths = {}
+    for band in _BANDS:
+        row = conn.execute(
+            "SELECT stored_path FROM bands "
+            "WHERE scene_id = ? AND revision = ? AND band = ?",
+            (scene_id, revision, band),
+        ).fetchone()
+        if row is None:
+            # Both bands are inserted in the same transaction as the scene
+            # row, so a missing one is a catalog defect, not a client error.
+            raise HTTPException(500, f"cataloged {band} band is missing")
+        paths[band] = str(storage.band_path(settings, row["stored_path"]))
+
+    try:
+        stats = compute_ndvi(paths["B04"], paths["B08"], threshold)
+    except AnalysisError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"cannot analyse scene {scene_id} revision {revision}: {exc}",
+        ) from exc
+
+    # Deliver only results that still describe the current revision.  A
+    # revision submitted while the windowed read was running makes this
+    # result stale; the caller has to retry against the newer revision.
+    if _current_revision_version(scene_id, conn) != version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=(
+                f"analysis of scene {scene_id} revision {revision} became stale: "
+                "a newer revision was submitted while it was running. "
+                "Retry the analysis to use the current revision."
+            ),
+        )
+
+    return NdviOut(
+        scene_id=scene_id,
+        revision=revision,
+        acquisition_time=acquisition_time,
+        threshold=threshold,
+        valid_pixel_count=stats.valid_pixel_count,
+        ndvi_mean=stats.ndvi_mean,
+        fraction_below_threshold=stats.fraction_below_threshold,
+    )
 
 
 @app.get(

@@ -4,9 +4,16 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     CATALOG_DB_PATH=/data/catalog.db \
-    CATALOG_STORAGE_DIR=/data/storage
+    CATALOG_STORAGE_DIR=/data/storage \
+    GDAL_CACHEMAX=16
 
 WORKDIR /app
+
+# rasterio bundles its own GDAL, but the C++ runtime it links against is not
+# part of the slim base image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

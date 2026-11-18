@@ -42,6 +42,25 @@ class SceneSummary(BaseModel):
     bands: list[BandOut]
 
 
+class NdviOut(BaseModel):
+    scene_id: str
+    revision: int
+    acquisition_time: str
+    threshold: float = Field(ge=-1, le=1)
+    valid_pixel_count: int = Field(
+        ge=0, description="Pixels with a defined NDVI (all exclusions applied)"
+    )
+    ndvi_mean: Optional[float] = Field(
+        default=None, description="Null when no pixel is valid"
+    )
+    fraction_below_threshold: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1,
+        description="Share of valid pixels whose NDVI is below the threshold; null when no pixel is valid",
+    )
+
+
 class HealthOut(BaseModel):
     status: Literal["ok"]
     database: Literal["ok"]
